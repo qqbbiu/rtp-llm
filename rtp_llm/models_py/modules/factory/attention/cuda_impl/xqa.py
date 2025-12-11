@@ -190,6 +190,8 @@ class XQAWrapper:
 
         # when nb_sub_seq_per_seq is -1, xqa will use the best config for the current gpu.
         # https://code.alibaba-inc.com/foundation_models/flashinfer/blob/main/best_config/NVIDIA_L20X_XQA_inbf16_cachefp8_outbf16_ps64_hd128_nq12_nkv1.json
+        from flashinfer.xqa import xqa
+
         xqa(
             q_4d,
             k_cache,
