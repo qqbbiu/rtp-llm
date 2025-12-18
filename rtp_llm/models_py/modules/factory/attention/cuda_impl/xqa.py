@@ -12,6 +12,14 @@ from rtp_llm.ops.compute_ops import (
 )
 
 
+@dataclass
+class XQAParams:
+    page_table: torch.Tensor
+    seq_lens: torch.Tensor
+    batch_size: int
+    max_seq_len: int
+
+
 class XQAImpl(FMHADecodeImplBase):
 
     def __init__(
@@ -77,26 +85,19 @@ class XQAWrapper:
 
     @staticmethod
     def support(attn_inputs: PyAttentionInputs) -> bool:
-        try:
-            return True
-        except (ImportError, AttributeError):
-            return False
+        return True
 
-    def prepare(self, attn_inputs: PyAttentionInputs):
-
-        class XQAParams:
-            pass
-
-        params = XQAParams()
-        params.page_table = attn_inputs.kv_cache_block_id_device
-        params.seq_lens = attn_inputs.sequence_lengths
-        params.batch_size = attn_inputs.sequence_lengths.size(0)
-        params.max_seq_len = (
-            attn_inputs.sequence_lengths.max().item() + 1
-            if attn_inputs.sequence_lengths.numel() > 0
-            else 0
-        )  # for rope cache
-        return params
+    def prepare(self, attn_inputs: PyAttentionInputs) -> XQAParams:
+        return XQAParams(
+            page_table=attn_inputs.kv_cache_block_id_device,
+            seq_lens=attn_inputs.sequence_lengths,
+            batch_size=attn_inputs.sequence_lengths.size(0),
+            max_seq_len=(
+                attn_inputs.sequence_lengths.max().item() + 1
+                if attn_inputs.sequence_lengths.numel() > 0
+                else 0
+            )  # for rope cache
+        )
 
     def init_spec_mask(self, q_4d: torch.Tensor):
         # init spec mask
@@ -149,7 +150,7 @@ class XQAWrapper:
         kv_cache,
         fmha_params,
     ) -> torch.Tensor:
-        # [num_pages, num_kv_heads, page_size, head_dim] - HND 布局
+        # [num_pages, num_kv_heads, page_size, head_dim] - HND layout
         k_cache = kv_cache.k_cache_base[:, 0, ...]
         v_cache = kv_cache.k_cache_base[:, 1, ...]
         page_table = fmha_params.page_table
@@ -184,7 +185,7 @@ class XQAWrapper:
             compute_capability = torch.cuda.get_device_capability(q.device)
             enable_pdl = compute_capability[0] >= 9  # SM90+
         except Exception as e:
-            logging.warning(f"[XQA] 无法获取 GPU 计算能力，禁用 PDL 优化: {e}")
+            logging.warning(f"[XQA] Failed to get GPU compute capability, PDL optimization disabled: {e}")
             enable_pdl = False
         spec_mask = self.init_spec_mask(q_4d)
 
@@ -215,3 +216,28 @@ class XQAWrapper:
             rcp_out_scale=1,
         )
         return output
+
+
+def get_xqa_impl() -> Type[FMHADecodeImplBase]:
+    """
+    Select the appropriate XQA implementation based on CUDA version and flashinfer availability.
+    
+    Returns XQADecodeImpl if CUDA >= 12.8 and flashinfer.xqa is available,
+    otherwise falls back to XQAImpl.
+    """
+    try:
+        major, minor = map(int, torch.version.cuda.split('.')[:2])
+        if (major, minor) >= (12, 8):
+            try:
+                from flashinfer.xqa import xqa
+                logging.info("CUDA >= 12.8 and flashinfer.xqa available, using XQADecodeImpl")
+                return XQADecodeImpl
+            except (ImportError, AttributeError) as e:
+                logging.info(f"CUDA >= 12.8 but flashinfer.xqa not available ({e}), falling back to XQAImpl")
+                return XQAImpl
+        else:
+            logging.info(f"CUDA version {major}.{minor} < 12.8, using XQAImpl")
+            return XQAImpl
+    except Exception as e:
+        logging.warning(f"Failed to check CUDA version ({e}), using XQAImpl")
+        return XQAImpl
