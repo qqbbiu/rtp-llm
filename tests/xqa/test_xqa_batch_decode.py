@@ -157,8 +157,16 @@ def create_kv_cache(
             device=GPU_DEVICE,
         )
 
-    k_scale = v_scale = 1.0
-    ref_kv_cache = torch.stack([k_cache, v_cache], dim=1)
+    if kv_dtype == "fp8":
+        k_cache, k_scale = to_float8(k_cache / 4.0)
+        v_cache, v_scale = to_float8(v_cache / 4.0)
+        ref_kv_cache = torch.stack([
+            k_cache.to(ref_kv_dtype_torch) * k_scale,
+            v_cache.to(ref_kv_dtype_torch) * v_scale,
+        ], dim=1)
+    else:
+        k_scale = v_scale = 1.0
+        ref_kv_cache = torch.stack([k_cache, v_cache], dim=1)
     # Combine K and V into interleaved format for the API
     kv_cache = torch.stack([k_cache, v_cache], dim=1)
 
@@ -568,23 +576,24 @@ class TestXQABatchDecode(unittest.TestCase):
         ]
         
         for use_qgmma, enable_pdl, enable_sink in test_cases:
-            self._test_xqa_batch_decode(
-                batch_size=1,
-                q_len_per_req=1,
-                page_size=64,
-                num_kv_heads=4,
-                head_grp_size=8,
-                window_left=-1,
-                q_dtype="bf16",
-                kv_dtype="fp8",
-                o_dtype="bf16",
-                enable_pdl=enable_pdl,
-                enable_sink=enable_sink,
-                max_in_kv_len=10,
-                kv_layout="HND",
-                head_dim=128,
-                use_qgmma=use_qgmma,
-            )
+            for q_len_per_req in [1, 5]:
+                self._test_xqa_batch_decode(
+                    batch_size=1,
+                    q_len_per_req=q_len_per_req,
+                    page_size=64,
+                    num_kv_heads=4,
+                    head_grp_size=8,
+                    window_left=-1,
+                    q_dtype="bf16",
+                    kv_dtype="fp8",
+                    o_dtype="bf16",
+                    enable_pdl=enable_pdl,
+                    enable_sink=enable_sink,
+                    max_in_kv_len=10,
+                    kv_layout="HND",
+                    head_dim=128,
+                    use_qgmma=use_qgmma,
+                )
 
 
 if __name__ == "__main__":
