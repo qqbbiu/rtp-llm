@@ -165,7 +165,10 @@ class AttnImplFactory(object):
     ) -> FMHAImplBase:
         # Extract AttentionConfigs from ModelConfig
         attn_configs = model_config.getAttentionConfigs(parallelism_config.tp_size)
-        if ConfigManager.get_headwise_config() is None:
+        if (
+            hasattr(model_config, "headwise_config")
+            and ConfigManager.get_headwise_config() is None
+        ):
             ConfigManager.set_headwise_config(model_config.headwise_config)
         key_str = "mla" if attn_configs.use_mla else "mha"
         fmha_impl_method = cls.FMHA_IMPL_REGISTRY[key_str]
