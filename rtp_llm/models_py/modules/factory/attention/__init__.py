@@ -51,7 +51,7 @@ else:
             get_xqa_impl,
         )
 
-        PREFILL_MHA_IMPS.extend([TRTMHAImpl, TRTPagedMHAImpl])
+        # PREFILL_MHA_IMPS.extend([TRTMHAImpl, TRTPagedMHAImpl])
         DECODE_MHA_IMPS.append(get_xqa_impl())
 
         from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashinfer_mla_wrapper import (
@@ -73,7 +73,7 @@ else:
         FlashInferPrefillImpl,
     )
 
-    PREFILL_MHA_IMPS.append(FlashInferPrefillImpl)
+    # PREFILL_MHA_IMPS.append(FlashInferPrefillImpl)
     DECODE_MHA_IMPS.append(FlashInferDecodeImpl)
 
     from rtp_llm.models_py.modules.factory.attention.cuda_impl.py_flashinfer_mha import (
