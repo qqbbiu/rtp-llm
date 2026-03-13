@@ -508,9 +508,9 @@ def tma_align_input_scale(input_scale: torch.Tensor):
 
     if input_scale.dim() == 2:
         output = output.squeeze(0)
-        return output.t()[:m]
+        return output.t()[:m].contiguous()
 
-    return output.transpose(1, 2)[:, :m, :]
+    return output.transpose(1, 2)[:, :m, :].contiguous()
 
 
 @triton.jit

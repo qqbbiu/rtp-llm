@@ -47,6 +47,9 @@ try:
             from rtp_llm.models_py.modules.factory.attention.cuda_headwise_impl.headwise import (
                 HeadWisePrefillImpl,
             )
+            from rtp_llm.models_py.modules.factory.attention.cuda_headwise_impl.headwise_fp8 import (
+                HeadWiseFP8PrefillImpl,
+            )
             from rtp_llm.models_py.modules.factory.attention.cuda_impl.py_flashinfer_mha import (
                 PyFlashinferDecodeImpl,
                 PyFlashinferPagedPrefillImpl,
@@ -67,6 +70,7 @@ try:
 
             PREFILL_MHA_IMPS.extend(
                 [
+                    HeadWiseFP8PrefillImpl,
                     HeadWisePrefillImpl,
                     FlashInferTRTLLMSpecDecodeImpl,
                     FlashInferTRTLLMPrefillImpl,

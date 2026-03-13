@@ -329,9 +329,10 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
     {
         tpSyncModelInputs(model_input, device_);
         maybePrintModelInput(model_input, "prefill post draft model");
-        const auto& mtp_cache_cfg         = cache_manager_->getMTPModuleCacheConfig(0);
-        model_input.kv_block_stride_bytes = mtp_cache_cfg.kv_block_stride_bytes;
-        draft_model_output                = std::move(draft_model_->forward(model_input));
+        const auto& mtp_cache_cfg          = cache_manager_->getMTPModuleCacheConfig(0);
+        model_input.kv_block_stride_bytes  = mtp_cache_cfg.kv_block_stride_bytes;
+        model_input.kv_scale_stride_bytes  = mtp_cache_cfg.kv_scale_stride_bytes;
+        draft_model_output                 = std::move(draft_model_->forward(model_input));
     }
 
     if (!isTpRank0() || warm_up_ || streams.size() == 0 || model_input.is_fake_stream) {
@@ -571,9 +572,10 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     tpSyncModelInputs(model_input, device_);
 
     maybePrintModelInput(model_input, "decode post draft model");
-    const auto& mtp_cache_cfg         = cache_manager_->getMTPModuleCacheConfig(0);
-    model_input.kv_block_stride_bytes = mtp_cache_cfg.kv_block_stride_bytes;
-    draft_prefill_model_output        = std::move(draft_model_->forward(model_input));
+    const auto& mtp_cache_cfg          = cache_manager_->getMTPModuleCacheConfig(0);
+    model_input.kv_block_stride_bytes  = mtp_cache_cfg.kv_block_stride_bytes;
+    model_input.kv_scale_stride_bytes  = mtp_cache_cfg.kv_scale_stride_bytes;
+    draft_prefill_model_output         = std::move(draft_model_->forward(model_input));
 
     if (!isTpRank0() || warm_up_ || streams.size() == 0 || model_input.is_fake_stream) {
         device_->syncAndCheck();
@@ -705,8 +707,9 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
     // clear host buffers holder
     buffer_holder_.release();
 
-    const auto& mtp_cache_cfg         = cache_manager_->getMTPModuleCacheConfig(0);
-    model_input.kv_block_stride_bytes = mtp_cache_cfg.kv_block_stride_bytes;
+    const auto& mtp_cache_cfg          = cache_manager_->getMTPModuleCacheConfig(0);
+    model_input.kv_block_stride_bytes  = mtp_cache_cfg.kv_block_stride_bytes;
+    model_input.kv_scale_stride_bytes  = mtp_cache_cfg.kv_scale_stride_bytes;
 
     GptModelOutputs            draft_decode_model_output;
     std::vector<torch::Tensor> draft_token_ids_list;
@@ -791,8 +794,9 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
     }
 
     tpSyncModelInputs(model_input, device_);
-    const auto& cache_cfg             = cache_manager_->cacheConfig();
-    model_input.kv_block_stride_bytes = cache_cfg.kv_block_stride_bytes;
+    const auto& cache_cfg              = cache_manager_->cacheConfig();
+    model_input.kv_block_stride_bytes  = cache_cfg.kv_block_stride_bytes;
+    model_input.kv_scale_stride_bytes  = cache_cfg.kv_scale_stride_bytes;
 }
 
 }  // namespace rtp_llm

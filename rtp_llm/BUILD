@@ -132,6 +132,8 @@ requirement([
     "rtp-kernel",
 ] + tensorrt + deep + flashinfer_with_cache + flashmla + flashattn)
 
+rtp_kernel_deps()
+
 filegroup(
     name = "cutlass_config",
     srcs = glob(["utils/gemm_utils/luts/*"]),

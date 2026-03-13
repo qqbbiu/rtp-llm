@@ -169,9 +169,8 @@ class TestHeadwisePrefillOp(unittest.TestCase):
         attn_inputs: PyAttentionInputs,
     ) -> torch.Tensor:
         op = self._get_or_create_op(case)
-        op.support(
-            attn_inputs
-        )  # It's good practice to call support to check compatibility
+        if not op.support(attn_inputs):
+            self.skipTest("HeadWisePrefillAttnOp not supported (missing flashinfer/rtp_kernel)")
         op.prepare(attn_inputs)
         op._get_headwise_config(0)
         return op.forward(qkv, cache, None)

@@ -6,20 +6,30 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
+_HAS_FLASHINFER = False
+_HAS_RTP_KERNEL = False
+
 try:
-    # amd fix
     from flashinfer import BatchPrefillWithPagedKVCacheWrapper
     from flashinfer.cascade import merge_state
-    from rtp_kernel.sparse_attention import BatchPrefillWithSparseAttention
+    _HAS_FLASHINFER = True
+except ImportError as e:
+    logging.warning(f"FlashInfer not found: {e}")
 
+try:
+    from rtp_kernel.sparse_attention import BatchPrefillWithSparseAttention
+    _HAS_RTP_KERNEL = True
+except ImportError as e:
+    logging.warning(f"rtp_kernel.sparse_attention not found: {e}")
+
+try:
     from rtp_llm.models_py.modules.factory.attention import common
     from rtp_llm.ops.compute_ops import (
         FusedRopeKVCachePrefillOpQKVOut,
         PyAttentionInputs,
     )
-
-except ImportError:
-    logging.warning("FlashInfer not found.")
+except ImportError as e:
+    logging.warning(f"rtp_llm attention common/compute_ops not found: {e}")
 
 from rtp_llm.models_py.modules.factory.attention.fmha_impl_base import FMHAImplBase
 from rtp_llm.ops import AttentionConfigs, ParallelismConfig
@@ -116,7 +126,8 @@ class HeadWisePrefillAttnOp:
         self.kv_lengths: Optional[torch.Tensor] = None
 
     def support(self, attn_inputs: PyAttentionInputs) -> bool:
-        # rtp_kernel only support cuda 12.8+
+        if not (_HAS_FLASHINFER and _HAS_RTP_KERNEL):
+            return False
         major, minor = map(int, torch.version.cuda.split(".")[:2])
         return (major, minor) >= (12, 8) and ConfigManager.is_config_set()
 
