@@ -1,10 +1,26 @@
 # Adapt from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/moe/ep_moe/kernels.py
 # but make some modifications for RTP-LLM
 # Licensed under the Apache License, Version 2.0
+import logging
 import math
+import os
 from typing import Any, Dict, Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
+
+_MOE_DEBUG_SYNC = os.environ.get("MOE_DEBUG_SYNC", "1") == "1"
+
+
+def _cuda_sync_check(stage: str):
+    """Sync CUDA and raise with stage info if a previous kernel had an error."""
+    try:
+        torch.cuda.synchronize()
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"CUDA error detected after '{stage}' in DeepGemmContinousExecutor: {e}"
+        ) from e
 
 from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
     is_deep_gemm_e8m0_used,
@@ -141,10 +157,43 @@ class DeepGemmContinousExecutor(FusedMoeExpertExecutor):
             )
         if isinstance(num_recv_tokens_per_expert, torch.Tensor):
             num_recv_tokens_per_expert = num_recv_tokens_per_expert.tolist()
+
+        raw_tokens_per_expert = list(num_recv_tokens_per_expert)
         num_recv_tokens_per_expert = [
             align_up_math(x, EXPERT_ALIGNMENT) for x in num_recv_tokens_per_expert
         ]
         all_tokens: int = sum(num_recv_tokens_per_expert)
+
+        if _MOE_DEBUG_SYNC:
+            num_experts_local = len(num_recv_tokens_per_expert)
+            actual_counts = []
+            for e in range(num_experts_local):
+                actual_counts.append(int((topk_idx == e).sum().item()))
+            logger.warning(
+                f"[DeepGemm DEBUG] M={hidden_states_fp8.shape[0]}, K={hidden_states_fp8.shape[1]}, "
+                f"num_experts={num_experts_local}, topk_ids range=[{topk_idx.min().item()}, {topk_idx.max().item()}], "
+                f"raw_tokens_per_expert={raw_tokens_per_expert}, "
+                f"aligned_tokens_per_expert={num_recv_tokens_per_expert}, "
+                f"actual_counts_from_topk={actual_counts}, "
+                f"all_tokens={all_tokens}, "
+                f"w13_shape={list(self.w13_weight.shape)}, w2_shape={list(self.w2_weight.shape)}"
+            )
+            for e in range(num_experts_local):
+                if actual_counts[e] > num_recv_tokens_per_expert[e]:
+                    logger.error(
+                        f"[DeepGemm OVERFLOW] expert {e}: actual_count={actual_counts[e]} > "
+                        f"aligned_alloc={num_recv_tokens_per_expert[e]} (raw={raw_tokens_per_expert[e]}). "
+                        f"Buffer will overflow!"
+                    )
+            if topk_idx.max().item() >= num_experts_local:
+                logger.error(
+                    f"[DeepGemm OOB] topk_ids max={topk_idx.max().item()} >= num_experts={num_experts_local}"
+                )
+            if torch.isnan(hidden_states_fp8.float()).any():
+                logger.error("[DeepGemm NaN] hidden_states_fp8 contains NaN!")
+            if torch.isinf(hidden_states_fp8.float()).any():
+                logger.error("[DeepGemm Inf] hidden_states_fp8 contains Inf!")
+
         if all_tokens <= 0:
             return CombineForwardPayload(
                 fused_expert_output=torch.zeros(
@@ -200,6 +249,28 @@ class DeepGemmContinousExecutor(FusedMoeExpertExecutor):
             output_index,
             scale_ue8m0=is_deep_gemm_e8m0_used(),
         )
+        if _MOE_DEBUG_SYNC:
+            _cuda_sync_check("ep_scatter")
+            final_locs = expert_start_loc.cpu().tolist()
+            m_min, m_max = m_indices.min().item(), m_indices.max().item()
+            logger.warning(
+                f"[DeepGemm DEBUG] after ep_scatter: expert_start_loc={final_locs}, "
+                f"m_indices range=[{m_min}, {m_max}], all_tokens={all_tokens}, "
+                f"input_data shape={list(input_tensor[0].shape)}, "
+                f"input_scale shape={list(input_tensor[1].shape)}, "
+                f"input_scale stride={input_tensor[1].stride()}, "
+                f"input_scale contiguous={input_tensor[1].is_contiguous()}"
+            )
+            if m_max >= self.num_experts_per_partition:
+                logger.error(
+                    f"[DeepGemm OOB] m_indices max={m_max} >= num_experts_per_partition="
+                    f"{self.num_experts_per_partition}, will cause weight OOB!"
+                )
+            if final_locs and max(final_locs) > all_tokens:
+                logger.error(
+                    f"[DeepGemm OVERFLOW] expert_start_loc max={max(final_locs)} > "
+                    f"all_tokens={all_tokens}, ep_scatter wrote beyond buffer!"
+                )
         dispose_tensor(hidden_states_fp8)
         gateup_output = torch.empty(
             (all_tokens, N),
@@ -208,6 +279,14 @@ class DeepGemmContinousExecutor(FusedMoeExpertExecutor):
         )
         if not is_deep_gemm_e8m0_used():
             input_tensor[1] = tma_align_input_scale(input_tensor[1])
+        if _MOE_DEBUG_SYNC:
+            logger.warning(
+                f"[DeepGemm DEBUG] before gate_up GEMM: "
+                f"a_data={list(input_tensor[0].shape)}, a_scale={list(input_tensor[1].shape)}, "
+                f"a_scale_stride={input_tensor[1].stride()}, "
+                f"b_data={list(self.w13_weight_fp8[0].shape)}, b_scale={list(self.w13_weight_fp8[1].shape)}, "
+                f"output={list(gateup_output.shape)}, m_indices len={m_indices.shape[0]}"
+            )
         m_grouped_fp8_gemm_nt_contiguous(
             (input_tensor[0], input_tensor[1]),
             self.w13_weight_fp8,
@@ -215,6 +294,8 @@ class DeepGemmContinousExecutor(FusedMoeExpertExecutor):
             m_indices,
             disable_ue8m0_cast=not is_deep_gemm_e8m0_used(),
         )
+        if _MOE_DEBUG_SYNC:
+            _cuda_sync_check("m_grouped_fp8_gemm_nt_contiguous(gate_up)")
         del input_tensor
         down_input = torch.empty(
             (
@@ -226,6 +307,8 @@ class DeepGemmContinousExecutor(FusedMoeExpertExecutor):
         )
         gateup_output = gateup_output.view(-1, N)
         silu_and_mul(down_input, gateup_output)
+        if _MOE_DEBUG_SYNC:
+            _cuda_sync_check("silu_and_mul")
         del gateup_output
         down_output = torch.empty(
             (all_tokens, K),
@@ -242,9 +325,19 @@ class DeepGemmContinousExecutor(FusedMoeExpertExecutor):
             )
         else:
             down_input_fp8, down_input_scale = trt_fp8_quantize_128(down_input, False)
+        if _MOE_DEBUG_SYNC:
+            _cuda_sync_check("fp8_quantize(down_input)")
         del down_input
         if not is_deep_gemm_e8m0_used():
             down_input_scale = tma_align_input_scale(down_input_scale)
+        if _MOE_DEBUG_SYNC:
+            logger.warning(
+                f"[DeepGemm DEBUG] before down GEMM: "
+                f"a_data={list(down_input_fp8.shape)}, a_scale={list(down_input_scale.shape)}, "
+                f"a_scale_stride={down_input_scale.stride()}, "
+                f"b_data={list(self.w2_weight_fp8[0].shape)}, b_scale={list(self.w2_weight_fp8[1].shape)}, "
+                f"output={list(down_output.shape)}, m_indices len={m_indices.shape[0]}"
+            )
         m_grouped_fp8_gemm_nt_contiguous(
             (down_input_fp8, down_input_scale),
             self.w2_weight_fp8,
@@ -252,6 +345,8 @@ class DeepGemmContinousExecutor(FusedMoeExpertExecutor):
             m_indices,
             disable_ue8m0_cast=not is_deep_gemm_e8m0_used(),
         )
+        if _MOE_DEBUG_SYNC:
+            _cuda_sync_check("m_grouped_fp8_gemm_nt_contiguous(down)")
         del down_input_fp8, down_input_scale
         gather_out = torch.empty(
             hidden_states_fp8_shape,
