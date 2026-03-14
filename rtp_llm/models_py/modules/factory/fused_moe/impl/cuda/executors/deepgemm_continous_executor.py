@@ -164,8 +164,33 @@ class DeepGemmContinousExecutor(FusedMoeExpertExecutor):
         ]
         all_tokens: int = sum(num_recv_tokens_per_expert)
 
+        num_experts_local = len(num_recv_tokens_per_expert)
+
+        has_nan = torch.isnan(hidden_states_fp8.float()).any().item()
+        has_inf = torch.isinf(hidden_states_fp8.float()).any().item()
+        if has_nan or has_inf:
+            logger.error(
+                f"[DeepGemm SKIP] hidden_states_fp8 contains {'NaN' if has_nan else ''}{'&Inf' if has_inf else ''}, "
+                f"M={hidden_states_fp8.shape[0]}, returning zeros to prevent CUDA OOB"
+            )
+            return CombineForwardPayload(
+                fused_expert_output=torch.zeros(
+                    hidden_states_fp8.shape,
+                    device=hidden_states_fp8.device,
+                    dtype=torch.bfloat16,
+                ),
+            )
+
+        topk_max = topk_idx.max().item()
+        topk_min = topk_idx.min().item()
+        if topk_max >= num_experts_local or topk_min < -1:
+            logger.error(
+                f"[DeepGemm CLAMP] topk_ids out of range [{topk_min}, {topk_max}], "
+                f"num_experts={num_experts_local}, clamping to valid range"
+            )
+            topk_idx = topk_idx.clamp(min=-1, max=num_experts_local - 1)
+
         if _MOE_DEBUG_SYNC:
-            num_experts_local = len(num_recv_tokens_per_expert)
             actual_counts = []
             for e in range(num_experts_local):
                 actual_counts.append(int((topk_idx == e).sum().item()))
@@ -185,14 +210,6 @@ class DeepGemmContinousExecutor(FusedMoeExpertExecutor):
                         f"aligned_alloc={num_recv_tokens_per_expert[e]} (raw={raw_tokens_per_expert[e]}). "
                         f"Buffer will overflow!"
                     )
-            if topk_idx.max().item() >= num_experts_local:
-                logger.error(
-                    f"[DeepGemm OOB] topk_ids max={topk_idx.max().item()} >= num_experts={num_experts_local}"
-                )
-            if torch.isnan(hidden_states_fp8.float()).any():
-                logger.error("[DeepGemm NaN] hidden_states_fp8 contains NaN!")
-            if torch.isinf(hidden_states_fp8.float()).any():
-                logger.error("[DeepGemm Inf] hidden_states_fp8 contains Inf!")
 
         if all_tokens <= 0:
             return CombineForwardPayload(
@@ -249,6 +266,7 @@ class DeepGemmContinousExecutor(FusedMoeExpertExecutor):
             output_index,
             scale_ue8m0=is_deep_gemm_e8m0_used(),
         )
+        m_indices.clamp_(min=0, max=self.num_experts_per_partition - 1)
         if _MOE_DEBUG_SYNC:
             _cuda_sync_check("ep_scatter")
             final_locs = expert_start_loc.cpu().tolist()
