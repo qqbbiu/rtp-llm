@@ -6,7 +6,13 @@ from rtp_llm.models_py.modules.factory.attention.fmha_impl_base import (
     FMHAImplBase,
     MlaImplBase,
 )
-from rtp_llm.ops import AttentionConfigs, FMHAConfig, KvCacheDataType, FMHAType, ParallelismConfig
+from rtp_llm.ops import (
+    AttentionConfigs,
+    FMHAConfig,
+    FMHAType,
+    KvCacheDataType,
+    ParallelismConfig,
+)
 from rtp_llm.ops.compute_ops import PyAttentionInputs
 from rtp_llm.utils.model_weight import W
 
@@ -145,16 +151,17 @@ def get_fmha_impl(
         if not impl.support_parallelism_config(parallelism_config):
             continue
 
-        try:
+        # try:
+        if 1:
             instance = impl(attn_configs, attn_inputs, parallelism_config)
             if not is_cuda_graph or instance.support_cuda_graph():
                 return instance
 
-        except Exception as e:
-            # If instantiation fails, continue to next impl
-            logging.warning(f"Failed to instantiate {impl_class_name}: {e}")
-            continue
-    raise Exception(f"can not find mha type")
+        # except Exception as e:
+        #     # If instantiation fails, continue to neClustering Statsxt impl
+        #     logging.warning(f"Failed to instantiate {impl_class_name}: {e}")
+        #     continue
+    # raise Exception(f"can not find mha type")
 
 
 class AttnImplFactory(object):

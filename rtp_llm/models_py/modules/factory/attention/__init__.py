@@ -46,6 +46,17 @@ try:
         DECODE_MHA_IMPS.append(AiterDecodeImplNonAsm)
         DECODE_MHA_IMPS.append(AiterDecodeImplTriton)
     else:
+
+        # Torch Naive implementations (fallback, lowest priority)
+        from rtp_llm.models_py.modules.factory.attention.cuda_impl.torch_naive import (
+            TorchNaiveClusteredDecodeImpl,
+            TorchNaiveClusteredPrefillImpl,
+            TorchNaiveDecodeImpl,
+            TorchNaivePrefillImpl,
+        )
+
+        # PREFILL_MHA_IMPS.extend([TorchNaiveClusteredPrefillImpl, TorchNaivePrefillImpl])
+        # DECODE_MHA_IMPS.extend([TorchNaiveClusteredDecodeImpl, TorchNaiveDecodeImpl])
         # currently append early means impl has higher priority
         if device_type == DeviceType.Cuda:
             from rtp_llm.models_py.modules.factory.attention.cuda_impl.py_flashinfer_mha import (
@@ -115,12 +126,14 @@ try:
             PyFlashinferDecodeImpl,
             PyFlashinferPrefillImpl,
         )
+
         PREFILL_MHA_IMPS.append(PyFlashinferPrefillImpl)
         DECODE_MHA_IMPS.append(PyFlashinferDecodeImpl)
-        
+
         from rtp_llm.models_py.modules.factory.attention.cuda_cp_impl.prefill_cp_flashinfer import (
             CPFlashInferImpl,
         )
+
         PREFILL_MHA_IMPS.append(CPFlashInferImpl)
 except Exception as e:
     logging.warning(f"Failed to import Attention implementation: {e}")
