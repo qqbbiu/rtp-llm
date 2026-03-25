@@ -108,61 +108,6 @@ def _kmeans_clustering(
     return centroids, labels, cluster_indices
 
 
-def _assign_to_cluster(
-    k_new: torch.Tensor,  # [head_dim] 单个新 K
-    centroids: torch.Tensor,  # [num_clusters, head_dim]
-) -> int:
-    """分配新 K 到最近的簇，返回簇索引."""
-    distances = torch.norm(centroids - k_new.unsqueeze(0), dim=1)  # [num_clusters]
-    cluster_idx = torch.argmin(distances).item()
-    return cluster_idx
-
-
-def _update_centroid(
-    centroid_old: torch.Tensor,  # [head_dim]
-    k_new: torch.Tensor,  # [head_dim]
-    cluster_size_old: int,
-) -> torch.Tensor:
-    """增量更新质心.
-
-    Formula: new_centroid = (old_centroid * size + k_new) / (size + 1)
-    """
-    return (centroid_old * cluster_size_old + k_new) / (cluster_size_old + 1)
-
-
-def _top_p_selection(
-    scores: torch.Tensor,  # [num_clusters] attention scores (softmax后)
-    p: float = 0.9,
-) -> torch.Tensor:
-    """Top-p (nucleus) 选择，返回选中的簇索引.
-
-    Args:
-        scores: 归一化后的 attention scores
-        p: 累积概率阈值
-
-    Returns:
-        selected_indices: [num_selected] 选中的簇索引
-    """
-    # 按分数降序排序
-    sorted_scores, sorted_indices = torch.sort(scores, descending=True)
-
-    # 计算累积概率
-    cumsum_scores = torch.cumsum(sorted_scores, dim=0)
-
-    # 找到累积概率超过 p 的位置
-    mask = cumsum_scores <= p
-    # 至少选择1个
-    if mask.sum() == 0:
-        mask[0] = True
-    # 包含第一个超过 p 的点
-    else:
-        first_exceed = (cumsum_scores > p).nonzero(as_tuple=True)[0]
-        if len(first_exceed) > 0:
-            mask[first_exceed[0]] = True
-
-    selected_indices = sorted_indices[mask]
-    return selected_indices
-
 
 class TorchNaivePrefillImpl(FMHAImplBase):
     """Torch Naive Prefill Attention Implementation.
@@ -975,14 +920,7 @@ class TorchNaiveClusteredDecodeImpl(TorchNaiveDecodeImpl):
             self.write_cache_store_impl, self.attn_inputs, kv_cache
         )
 
-        # 5. Update clustering: 将新 K 分配到簇并更新质心
-        k_full_temp, _ = self._read_kv_from_cache(kv_cache)
-        k = k_full_temp[:, -1:, :, :]  # Get only the last token (new K)
-        k = k.squeeze(1)  # Remove seq dimension: [batch, kv_heads, head_dim]
 
-        self._update_clustering(k, kv_cache)
-
-        # 6. Read complete K, V from cache (including history)
         k_full, v_full = self._read_kv_from_cache(kv_cache)
 
         # 7. Execute clustered decode attention (NEW)
@@ -993,200 +931,156 @@ class TorchNaiveClusteredDecodeImpl(TorchNaiveDecodeImpl):
 
         return output
 
-    def _update_clustering(
-        self,
-        k_new: torch.Tensor,  # [batch_size, num_kv_heads, head_dim]
-        kv_cache: Optional[KVCache],
-    ) -> None:
-        """使用 IncrementalKMeans 将新 K 增量更新到聚类（NEW 实现）.
-
-        Args:
-            k_new: 新生成的 Key tensor
-            kv_cache: KV cache object
-        """
-        if kv_cache is None:
-            return
-
-        layer_id = kv_cache.layer_id
-        batch_size = k_new.shape[0]
-
-        for batch_idx in range(batch_size):
-            for head_idx in range(k_new.shape[1]):
-                key = f"layer_{layer_id}_seq_{batch_idx}_head_{head_idx}"
-
-                if key not in _CLUSTER_CACHE:
-                    # 没有聚类信息，跳过（可能是新序列）
-                    exit(0)
-                    # continue
-
-                cluster_info = _CLUSTER_CACHE[key]
-
-                # NEW: 使用 IncrementalKMeans
-                if "model" in cluster_info:
-                    model = cluster_info["model"]
-                    k_single = k_new[batch_idx, head_idx, :].unsqueeze(
-                        0
-                    )  # [1, head_dim]
-
-                    # 增量添加新点并更新质心（一行代码完成！）
-                    label = model.add_points(k_single, update_centroids=True)
-
-                    # 更新 cache 中的质心和统计信息
-                    cluster_info["centroids"] = model.get_centroids()
-                    _, counts = model.get_statistics()
-                    cluster_info["cluster_sizes"] = counts
-
-                    # 更新簇的 token 索引
-                    cluster_idx = label.item()
-                    new_token_idx = cluster_info["seq_len"]
-                    cluster_info["cluster_indices"][cluster_idx].append(new_token_idx)
-                    cluster_info["seq_len"] += 1
-
-                    logging.debug(
-                        f"Update clustering (IncrementalKMeans): {key}, "
-                        f"assigned to cluster {cluster_idx}, "
-                        f"new_size={counts[cluster_idx].item()}"
-                    )
-                else:
-                    # FALLBACK: 使用旧的手动实现（兼容性）
-                    centroids = cluster_info["centroids"]
-                    sizes = cluster_info["cluster_sizes"]
-                    indices = cluster_info["cluster_indices"]
-
-                    k_single = k_new[batch_idx, head_idx, :]
-                    cluster_idx = _assign_to_cluster(k_single, centroids)
-                    centroids[cluster_idx] = _update_centroid(
-                        centroids[cluster_idx], k_single, sizes[cluster_idx].item()
-                    )
-                    sizes[cluster_idx] += 1
-
-                    new_token_idx = cluster_info["seq_len"]
-                    indices[cluster_idx].append(new_token_idx)
-                    cluster_info["seq_len"] += 1
-
-                    logging.warning(
-                        f"Fallback to manual update for {key} "
-                        f"(IncrementalKMeans model not found)"
-                    )
-
     def _run_clustered_attention_decode(
         self,
-        q: torch.Tensor,  # [batch_size, num_heads, head_dim]
+        q: torch.Tensor,       # [batch_size, num_heads, head_dim]
         k_full: torch.Tensor,  # [batch_size, total_seq_len, num_kv_heads, head_dim]
         v_full: torch.Tensor,  # [batch_size, total_seq_len, num_kv_heads, head_dim]
         kv_cache: Optional[KVCache],
     ) -> torch.Tensor:
         """使用聚类加速的 Decode Attention.
 
-        流程:
-        1. Q @ centroids 计算 attention score
-        2. Top-p 选择重要的簇
-        3. 对选中簇的 tokens 做 Full Attention
+        Phase 1: 单循环收集 centroids + pack → cu_seqlen 批量打分 → 向量化 scatter + 批量 topk
+        Phase 2: gather K, V → pad 到 max_selected → 统一批量 SDPA（无分支）
 
         Returns:
             output: [batch_size, num_heads, head_dim]
         """
-        batch_size = q.shape[0]
+        batch_size, num_heads, head_dim = q.shape
+        num_kv_heads = self.num_kv_heads
         layer_id = kv_cache.layer_id if kv_cache is not None else 0
+        num_groups = self.num_heads // num_kv_heads if self.enable_gqa else 1
+        top_k = 8
+        total_items = batch_size * num_heads
 
-        # GQA handling
+        # ── Phase 1: 单循环收集 + cu_seqlen 批量打分 + 批量 topk ──
+        centroid_list = []
+        cluster_indices_list = []
+        num_clusters_list = []
+
+        for batch_idx in range(batch_size):
+            for head_idx in range(num_heads):
+                kv_head_idx = head_idx // num_groups
+                key = f"layer_{layer_id}_seq_{batch_idx}_head_{kv_head_idx}"
+                if key not in _CLUSTER_CACHE:
+                    logging.warning(f"Cluster cache miss: {key}")
+                    return self._run_full_attention_batched(q, k_full, v_full)
+                cluster_info = _CLUSTER_CACHE[key]
+                centroids = (cluster_info["model"].get_centroids()
+                             if "model" in cluster_info
+                             else cluster_info["centroids"])
+                centroid_list.append(centroids)
+                cluster_indices_list.append(cluster_info["cluster_indices"])
+                num_clusters_list.append(centroids.shape[0])
+
+        centroids_packed = torch.cat(centroid_list, dim=0)  # [total_C, D]
+
+        num_clusters_t = torch.tensor(num_clusters_list, device=q.device, dtype=torch.long)
+        cu_lens = torch.zeros(total_items + 1, dtype=torch.long, device=q.device)
+        cu_lens[1:] = num_clusters_t.cumsum(0)
+        total_C = cu_lens[-1].item()
+
+        item_ids = torch.repeat_interleave(
+            torch.arange(total_items, device=q.device), num_clusters_t
+        )  # [total_C]
+
+        q_flat = q.reshape(total_items, head_dim)
+        scores_packed = (q_flat[item_ids] * centroids_packed).sum(-1)  # [total_C]
+
+        max_C = num_clusters_t.max().item()
+        actual_k = min(top_k, max_C)
+
+        col_idx = torch.arange(total_C, device=q.device) - cu_lens[item_ids]
+        scores_padded = torch.full(
+            (total_items, max_C), float('-inf'), device=q.device, dtype=scores_packed.dtype
+        )
+        scores_padded[item_ids, col_idx] = scores_packed
+
+        selected_cluster_ids = torch.topk(
+            scores_padded, k=actual_k, dim=1
+        ).indices  # [B*H, actual_k]
+
+        # ── Phase 2: gather K, V → pad → 统一批量 SDPA ──
+        all_token_ids = []
+        for i in range(total_items):
+            c_indices = cluster_indices_list[i]
+            token_ids = set()
+            for cid in selected_cluster_ids[i]:
+                cid_val = cid.item()
+                if cid_val < len(c_indices):
+                    token_ids.update(c_indices[cid_val])
+            all_token_ids.append(sorted(token_ids))
+
+        num_selected_list = [len(t) for t in all_token_ids]
+        max_selected = max(num_selected_list) if num_selected_list else 0
+        if max_selected == 0:
+            return torch.zeros_like(q)
+
+        k_padded = torch.zeros(total_items, max_selected, head_dim, device=q.device, dtype=q.dtype)
+        v_padded = torch.zeros(total_items, max_selected, head_dim, device=q.device, dtype=q.dtype)
+        attn_mask = torch.zeros(total_items, 1, 1, max_selected, device=q.device, dtype=q.dtype)
+
+        for i in range(total_items):
+            n = num_selected_list[i]
+            if n == 0:
+                attn_mask[i, 0, 0, :] = float('-inf')
+                continue
+            batch_idx = i // num_heads
+            kv_head_idx = (i % num_heads) // num_groups
+            idx_t = torch.tensor(all_token_ids[i], device=q.device, dtype=torch.long)
+            k_padded[i, :n, :] = k_full[batch_idx, idx_t, kv_head_idx, :]
+            v_padded[i, :n, :] = v_full[batch_idx, idx_t, kv_head_idx, :]
+            if n < max_selected:
+                attn_mask[i, 0, 0, n:] = float('-inf')
+
+        q_sdpa = q_flat.unsqueeze(1).unsqueeze(1)  # [B*H, 1, 1, D]
+        k_sdpa = k_padded.unsqueeze(1)              # [B*H, 1, S, D]
+        v_sdpa = v_padded.unsqueeze(1)              # [B*H, 1, S, D]
+
+        if not (q_sdpa.dtype == k_sdpa.dtype == v_sdpa.dtype):
+            k_sdpa = k_sdpa.to(q_sdpa.dtype)
+            v_sdpa = v_sdpa.to(q_sdpa.dtype)
+
+        attn_out = scaled_dot_product_attention(
+            q_sdpa, k_sdpa, v_sdpa,
+            attn_mask=attn_mask, dropout_p=0.0, is_causal=False, scale=self.scaling,
+        )
+        output = attn_out.squeeze(2).squeeze(1).reshape(batch_size, num_heads, head_dim)
+
+        total_tokens = k_full.shape[1]
+        logging.info(
+            f"[Clustering Stats] Batched SDPA: "
+            f"{actual_k} clusters, max_selected={max_selected}/{total_tokens} tokens"
+        )
+
+        return output
+
+    def _run_full_attention_batched(
+        self,
+        q: torch.Tensor,       # [B, H, D]
+        k_full: torch.Tensor,  # [B, S, Hkv, D]
+        v_full: torch.Tensor,  # [B, S, Hkv, D]
+    ) -> torch.Tensor:
+        """Cache miss fallback: 批量 full attention."""
         if self.enable_gqa:
             num_groups = self.num_heads // self.num_kv_heads
             k_full = k_full.repeat_interleave(num_groups, dim=2)
             v_full = v_full.repeat_interleave(num_groups, dim=2)
 
-        output = torch.empty_like(q)
+        q_sdpa = q.unsqueeze(2)          # [B, H, 1, D]
+        k_sdpa = k_full.transpose(1, 2)  # [B, H, S, D]
+        v_sdpa = v_full.transpose(1, 2)
 
-        # 按 batch 和 head 处理
-        for batch_idx in range(batch_size):
-            for head_idx in range(q.shape[1]):
-                # 将 Q head index 映射到 KV head index（GQA 场景）
-                if self.enable_gqa:
-                    num_groups = self.num_heads // self.num_kv_heads
-                    kv_head_idx = head_idx // num_groups
-                else:
-                    kv_head_idx = head_idx
+        if not (q_sdpa.dtype == k_sdpa.dtype == v_sdpa.dtype):
+            k_sdpa = k_sdpa.to(q_sdpa.dtype)
+            v_sdpa = v_sdpa.to(q_sdpa.dtype)
 
-                key = f"layer_{layer_id}_seq_{batch_idx}_head_{kv_head_idx}"
-
-                # 如果没有聚类信息，fallback 到 Full Attention
-                if key not in _CLUSTER_CACHE:
-                    # output[batch_idx, head_idx, :] = self._full_attention_single(
-                    #     q[batch_idx, head_idx, :],
-                    #     k_full[batch_idx, :, head_idx, :],
-                    #     v_full[batch_idx, :, head_idx, :]
-                    # )
-                    # continue
-                    exit(0)
-
-                cluster_info = _CLUSTER_CACHE[key]
-
-                # NEW: 优先从 IncrementalKMeans 模型获取质心
-                if "model" in cluster_info:
-                    centroids = cluster_info["model"].get_centroids()
-                else:
-                    centroids = cluster_info["centroids"]
-
-                cluster_indices = cluster_info["cluster_indices"]
-
-                q_single = q[batch_idx, head_idx, :]  # [head_dim]
-
-                # Step 1: Q @ centroids 计算 attention score
-                scores = (
-                    torch.matmul(q_single, centroids.T) * self.scaling
-                )  # [num_clusters]
-
-                # 加上簇大小的对数，让大簇有更高的权重
-                cluster_sizes = cluster_info["cluster_sizes"]
-                scores = scores + torch.log(cluster_sizes.float() + 1e-8)  # 避免 log(0)
-
-                scores = torch.softmax(scores, dim=0)
-
-                # Step 2: Top-p 选择簇
-                selected_cluster_ids = _top_p_selection(scores, self.top_p)
-
-                # Step 3: 收集选中簇的所有 token 索引
-                selected_token_ids = []
-                for cluster_id in selected_cluster_ids:
-                    selected_token_ids.extend(cluster_indices[cluster_id.item()])
-
-                if len(selected_token_ids) == 0:
-                    # 没有选中任何 token，使用零向量或 fallback
-                    output[batch_idx, head_idx, :] = 0.0
-                    logging.warning(f"No tokens selected for {key}, using zero output")
-                    continue
-
-                # 去重并排序
-                selected_token_ids = sorted(set(selected_token_ids))
-
-                # Step 4: 对选中的 tokens 做 Full Attention
-                selected_k = k_full[
-                    batch_idx, selected_token_ids, head_idx, :
-                ]  # [num_selected, head_dim]
-                selected_v = v_full[batch_idx, selected_token_ids, head_idx, :]
-
-                # 打印聚类统计信息
-                total_tokens = k_full.shape[1]
-                total_clusters = centroids.shape[0]
-                selected_tokens_count = len(selected_token_ids)
-                selected_clusters_count = len(selected_cluster_ids)
-
-                logging.info(
-                    f"[Clustering Stats] {key}: "
-                    f"Selected {selected_clusters_count}/{total_clusters} clusters ({selected_clusters_count/total_clusters*100:.1f}%), "
-                    f"Selected {selected_tokens_count}/{total_tokens} tokens ({selected_tokens_count/total_tokens*100:.1f}%)"
-                )
-
-                output[batch_idx, head_idx, :] = self._full_attention_single(
-                    q_single, selected_k, selected_v
-                )
-
-                logging.debug(
-                    f"Clustered attention: {key}, selected {len(selected_token_ids)} / "
-                    f"{k_full.shape[1]} tokens ({len(selected_token_ids)/k_full.shape[1]*100:.1f}%)"
-                )
-
-        return output
+        attn_out = scaled_dot_product_attention(
+            q_sdpa, k_sdpa, v_sdpa,
+            attn_mask=None, dropout_p=0.0, is_causal=False, scale=self.scaling,
+        )
+        logging.warning("[Clustering] Fallback to full attention (cache miss)")
+        return attn_out.squeeze(2)
 
     def _full_attention_single(
         self,
