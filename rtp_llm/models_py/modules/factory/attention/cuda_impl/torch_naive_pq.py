@@ -18,7 +18,8 @@ import torch
 import triton
 import triton.language as tl
 
-import flashinfer
+from flashinfer import xqa as flashinfer_xqa
+from flashinfer import xqa_continuous
 
 from rtp_llm.models_py.modules.factory.attention import common
 from rtp_llm.models_py.modules.factory.attention.cuda_impl.pq_kmeans_triton import (
@@ -365,9 +366,31 @@ class TorchNaivePQDecodeImpl(TorchNaiveDecodeImpl):
         self.num_subspaces = int(os.getenv("PQ_NUM_SUBSPACES", "16"))
         self.top_k_tokens = int(os.getenv("PQ_TOP_K_TOKENS", "2000"))
 
+        self._sm_count = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+        self._xqa_scratch: Optional[torch.Tensor] = None
+        self._xqa_semaphores: Optional[torch.Tensor] = None
+
         logging.info(
             f"TorchNaivePQDecodeImpl: S={self.num_subspaces}, top_k={self.top_k_tokens}"
         )
+
+    def prepare_cuda_graph(self, attn_inputs: PyAttentionInputs):
+        super().prepare_cuda_graph(attn_inputs)
+        self._cuda_graph_mode = True
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        batch_size = attn_inputs.input_lengths.size(0)
+        if self._xqa_scratch is None:
+            self._xqa_scratch = torch.zeros(
+                256 << 20, dtype=torch.uint8, device=device
+            )
+        nb_seq = self.num_kv_heads * batch_size
+        nb_sem = ((nb_seq + 1) // 2 * 2) + 2 + nb_seq + 2
+        if self._xqa_semaphores is None or self._xqa_semaphores.shape[0] < nb_sem:
+            self._xqa_semaphores = torch.zeros(
+                max(nb_sem, 256), dtype=torch.uint32, device=device
+            )
 
     def forward(
         self,
@@ -385,30 +408,141 @@ class TorchNaivePQDecodeImpl(TorchNaiveDecodeImpl):
             self.write_cache_store_impl, self.attn_inputs, kv_cache
         )
 
-        k_full, v_full = self._read_kv_from_cache(kv_cache)
-        output = self._run_pq_attention_decode(q, k_full, v_full, kv_cache)
+        batch_size = q.shape[0]
+        layer_id = kv_cache.layer_id if kv_cache is not None else 0
+
+        has_pq = any(
+            load_pq_batch_from_attn_inputs(
+                self.attn_inputs, layer_id, h, batch_size
+            ) is not None
+            for h in range(self.num_kv_heads)
+        )
+
+        if not has_pq:
+            output = self._xqa_paged_attention(q, kv_cache)
+        else:
+            k_full, v_full = self._read_kv_from_cache(kv_cache)
+            output = self._run_pq_attention_decode(q, k_full, v_full, kv_cache)
         return output.reshape(output.shape[0], -1)
+
+    def _xqa_paged_attention(
+        self,
+        q: torch.Tensor,       # [bs, num_q_heads, head_dim]
+        kv_cache: KVCache,
+    ) -> torch.Tensor:
+        batch_size = q.shape[0]
+        device = q.device
+
+        kv_base = kv_cache.kv_cache_base
+        tpb = self.tokens_per_block
+
+        if kv_base.ndim == 2:
+            block_num = kv_base.shape[0]
+            expected = 2 * self.num_kv_heads * tpb * self.head_dim
+            kv_tensor = kv_base[:, :expected].reshape(
+                block_num, 2, self.num_kv_heads, tpb, self.head_dim
+            )
+        else:
+            kv_tensor = kv_base
+
+        k_cache = kv_tensor[:, 0]  # [num_pages, num_kv_heads, tpb, head_dim]
+        v_cache = kv_tensor[:, 1]
+
+        if hasattr(self, "_block_indices_gpu"):
+            page_table = self._block_indices_gpu.to(torch.int32)
+        elif self.attn_inputs.kv_cache_block_id_host is not None:
+            page_table = self.attn_inputs.kv_cache_block_id_host[0][
+                :batch_size, :
+            ].to(device=device, dtype=torch.int32)
+        else:
+            return torch.zeros(
+                batch_size, self.num_heads, self.head_dim,
+                dtype=q.dtype, device=device,
+            )
+
+        seq_lens = self._compute_kv_seq_lens(batch_size).to(device=device, dtype=torch.int32)
+
+        q_xqa = q.unsqueeze(1).to(k_cache.dtype)
+        output = torch.empty_like(q_xqa)
+
+        self._ensure_xqa_buffers(device, batch_size)
+        self._xqa_semaphores.zero_()
+
+        xqa_kwargs = dict(
+            num_kv_heads=self.num_kv_heads, page_size=tpb,
+            kv_layout="HND", sm_count=self._sm_count,
+        )
+        if getattr(self, "_cuda_graph_mode", False):
+            xqa_kwargs["nb_sub_seq_per_seq"] = 16
+
+        flashinfer_xqa(
+            q_xqa, k_cache, v_cache, page_table, seq_lens, output,
+            self._xqa_scratch, self._xqa_semaphores,
+            **xqa_kwargs,
+        )
+        return output.squeeze(1).to(q.dtype)
 
     def _compute_kv_seq_lens(self, batch_size: int) -> torch.Tensor:
         from rtp_llm.ops.compute_ops import fill_mla_params
 
-        ai = self.attn_inputs
         params = fill_mla_params(
             (
-                ai.prefix_lengths
-                if getattr(ai, "prefix_lengths", None) is not None
+                self.attn_inputs.prefix_lengths
+                if getattr(self.attn_inputs, "prefix_lengths", None) is not None
                 else torch.tensor([], dtype=torch.int32)
             ),
-            ai.sequence_lengths,
-            ai.input_lengths,
+            self.attn_inputs.sequence_lengths,
+            self.attn_inputs.input_lengths,
             (
-                ai.kv_cache_block_id_host
-                if ai.kv_cache_block_id_host is not None
+                self.attn_inputs.kv_cache_block_id_host
+                if self.attn_inputs.kv_cache_block_id_host is not None
                 else torch.tensor([], dtype=torch.int32)
             ),
             self.tokens_per_block,
         )
         return params.kvlen_h[:batch_size]
+
+    def _ensure_xqa_buffers(self, device: torch.device, batch_size: int):
+        if self._xqa_scratch is None:
+            self._xqa_scratch = torch.zeros(256 << 20, dtype=torch.uint8, device=device)
+        nb_seq = self.num_kv_heads * batch_size
+        nb_sem = ((nb_seq + 1) // 2 * 2) + 2 + nb_seq + 2
+        if self._xqa_semaphores is None or self._xqa_semaphores.shape[0] < nb_sem:
+            self._xqa_semaphores = torch.zeros(
+                max(nb_sem, 256), dtype=torch.uint32, device=device
+            )
+
+    def _xqa_full_attention(
+        self,
+        q: torch.Tensor,       # [bs, num_q_heads, head_dim]
+        k_full: torch.Tensor,  # [bs, max_seq_len, num_kv_heads, head_dim]
+        v_full: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_seq_len: int,
+    ) -> torch.Tensor:
+        bs = q.shape[0]
+        q_xqa = q.unsqueeze(1)  # [bs, 1, num_q_heads, head_dim]
+
+        k_t = k_full.permute(0, 2, 1, 3)  # [bs, num_kv_heads, max_seq_len, head_dim]
+        v_t = v_full.permute(0, 2, 1, 3)
+        kv_cache_xqa = torch.stack([k_t, v_t], dim=2).unsqueeze(1).to(q.dtype)
+
+        output = torch.empty_like(q_xqa)
+        seq_lens_u32 = seq_lens.to(torch.uint32).unsqueeze(1)
+
+        self._xqa_semaphores.zero_()
+        cont_kwargs = dict(
+            num_kv_heads=self.num_kv_heads, max_seq_len=max_seq_len,
+            sm_count=self._sm_count,
+        )
+        if getattr(self, "_cuda_graph_mode", False):
+            cont_kwargs["nb_sub_seq_per_seq"] = 16
+        xqa_continuous(
+            q_xqa, kv_cache_xqa, seq_lens_u32, output,
+            self._xqa_scratch, self._xqa_semaphores,
+            **cont_kwargs,
+        )
+        return output.squeeze(1)
 
     def _run_pq_attention_decode(
         self,
@@ -424,8 +558,20 @@ class TorchNaivePQDecodeImpl(TorchNaiveDecodeImpl):
         device = q.device
         max_seq_len = k_full.shape[1]
 
-        output = torch.empty_like(q)
+        self._ensure_xqa_buffers(device, batch_size)
 
+        has_pq = False
+        for kv_head_idx in range(self.num_kv_heads):
+            if load_pq_batch_from_attn_inputs(
+                self.attn_inputs, layer_id, kv_head_idx, batch_size,
+            ) is not None:
+                has_pq = True
+                break
+
+        if not has_pq:
+            return self._xqa_full_attention(q, k_full, v_full, seq_lens, max_seq_len)
+
+        output = torch.empty_like(q)
         for kv_head_idx in range(self.num_kv_heads):
             start_h = kv_head_idx * num_groups
             end_h = start_h + num_groups
@@ -578,7 +724,9 @@ class TorchNaivePQDecodeImpl(TorchNaiveDecodeImpl):
         if cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             xqa_kwargs["kv_scale"] = torch.tensor(1.0, device=device)
 
-        flashinfer.xqa_continuous(
+        if getattr(self, "_cuda_graph_mode", False):
+            xqa_kwargs["nb_sub_seq_per_seq"] = 16
+        xqa_continuous(
             q_4d, kv_cache, seq_lens_2d, output,
             self._xqa_workspace, semaphores,
             **xqa_kwargs,
